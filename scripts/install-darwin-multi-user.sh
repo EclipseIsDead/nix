@@ -67,6 +67,21 @@ test_nix_daemon_installed() {
 }
 
 poly_cure_artifacts() {
+    # nix-installer manages the volume, its mount daemon and the fstab
+    # entry itself. Repairing them from here breaks that installation
+    # (its mount daemon can't unlock a volume we encrypt, for one), and
+    # the nix-env check in validate_starting_assumptions never sees it
+    # because the volume may already be unmounted by then.
+    if [ -e /nix/receipt.json ] || [ -e /Library/LaunchDaemons/systems.determinate.nix-installer.nix-hook.plist ]; then
+        failure <<EOF
+Nix on this machine was installed with nix-installer
+(https://github.com/NixOS/nix-installer). This installer can't repair or
+replace that installation without breaking it. To reinstall Nix, remove
+the existing installation first:
+  /nix/nix-installer uninstall
+EOF
+    fi
+    check_synthetic_conf_readable
     if should_create_volume; then
         task "Fixing any leftover Nix volume state"
         cat <<EOF

@@ -225,6 +225,21 @@ test_synthetic_conf_symlinked() {
     /usr/bin/grep -qE "^${NIX_ROOT:1}\t.{3,}$" /etc/synthetic.conf 2>/dev/null
 }
 
+# The test_synthetic_conf_* checks grep the file as the invoking user. If it
+# exists but isn't readable they all report "not configured", and the
+# installer would go on to append a duplicate entry and then fail the same
+# check again, so stop with the actual reason instead.
+check_synthetic_conf_readable() {
+    if [ -e /etc/synthetic.conf ] && ! [ -r /etc/synthetic.conf ]; then
+        failure >&2 <<EOF
+error: /etc/synthetic.conf exists but is not readable by $USER, so I can't
+tell whether $NIX_ROOT is already configured in it. Make it readable and
+re-run the installer:
+  sudo chmod 644 /etc/synthetic.conf
+EOF
+    fi
+}
+
 test_nix_volume_mountd_installed() {
     test -e "$NIX_VOLUME_MOUNTD_DEST"
 }
@@ -609,6 +624,17 @@ EOF
             if ui_confirm "Should I encrypt it and add the decryption key to your keychain?"; then
                 encrypt_volume "$volume_uuid" "$NIX_VOLUME_LABEL"
                 NIX_VOLUME_DO_ENCRYPT=0
+                if test_voldaemon; then
+                    # The existing daemon was written for an unencrypted
+                    # volume and can't unlock this one. Remove it so that
+                    # setup_volume_daemon installs the encrypted variant,
+                    # otherwise the volume never comes back after the
+                    # unmount above and nothing mounts it at boot.
+                    task "Replacing the mount daemon with one that can unlock the volume" >&2
+                    _sudo "to terminate the old mount daemon" \
+                        launchctl bootout "system/org.nixos.darwin-store" 2> >(_eat_bootout_err >&2) || true
+                    _sudo "to remove the old mount daemon definition" rm "$NIX_VOLUME_MOUNTD_DEST"
+                fi
             else
                 NIX_VOLUME_DO_ENCRYPT=0
                 reminder "FileVault is on, but your $NIX_VOLUME_LABEL volume isn't encrypted."
@@ -639,6 +665,7 @@ remove_volume_artifacts() {
 }
 
 setup_synthetic_conf() {
+    check_synthetic_conf_readable
     if test_nix_root_is_symlink; then
         if ! test_synthetic_conf_symlinked; then
             failure >&2 <<EOF
@@ -757,9 +784,22 @@ volume_uuid_from_special() {
 # fails in around 50-100ms and a match takes about
 # 250-300ms. I suspect it's usually ~250-750ms
 await_volume() {
-    # caution: this could, in theory, get stuck
+    # The mount is done by the LaunchDaemon; if that fails (wrong plist
+    # for an encrypted volume, missing keychain entry, ...) nothing will
+    # ever mount it, so give up with a pointer rather than spinning.
+    local waited=0
     until /usr/sbin/diskutil info "$NIX_ROOT" &>/dev/null; do
-        :
+        if [ "$waited" -ge 60 ]; then
+            failure >&2 <<EOF
+error: the Nix volume was not mounted at $NIX_ROOT within 60 seconds.
+The LaunchDaemon that mounts it may have failed. Inspect it with:
+  sudo launchctl print system/org.nixos.darwin-store
+and retry the mount with:
+  sudo launchctl kickstart -k system/org.nixos.darwin-store
+EOF
+        fi
+        sleep 1
+        waited=$((waited + 1))
     done
 }
 
